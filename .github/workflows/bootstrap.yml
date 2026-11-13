@@ -1,0 +1,122 @@
+name: Bootstrap GSM
+on:
+  workflow_dispatch:
+    inputs:
+      nama_paket:
+        description: "Nama paket aplikasi (menentukan folder /data/data/NAMA/files/usr)"
+        required: true
+        default: "com.garuda.simplemanager"
+      dengan_apt:
+        description: "true = sertakan apt (107 paket, jauh lebih lama). false = tanpa apt (46 paket, cepat)"
+        required: false
+        default: "false"
+      paket_tambahan:
+        description: "Paket tambahan, pisahkan dengan koma (kosong = bawaan saja)"
+        required: false
+        default: ""
+jobs:
+  bangun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Ambil sumber paket Termux
+        uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          path: tp
+          fetch-depth: 1
+      - name: Bebaskan ruang disk
+        working-directory: tp
+        run: ./scripts/free-space.sh
+      - name: Ganti nama paket aplikasi
+        working-directory: tp
+        env:
+          NAMA: ${{ inputs.nama_paket }}
+        run: |
+          sed -i "s|^TERMUX_APP__PACKAGE_NAME=.*|TERMUX_APP__PACKAGE_NAME=\"${NAMA}\"|" scripts/properties.sh
+          grep -n '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
+      - name: Perbaiki skrip bootstrap resmi
+        working-directory: tp
+        env:
+          DENGAN_APT: ${{ inputs.dengan_apt }}
+        run: |
+          sed -i 's/PACKAGES+=("bzip2")/PACKAGES+=("libbz2")/' scripts/build-bootstraps.sh
+          if [ "$DENGAN_APT" = "true" ]; then
+            sed -i 's/PACKAGES+=("apt")/ADDITIONAL_PACKAGES+=("apt")/' scripts/build-bootstraps.sh
+          else
+            sed -i 's/PACKAGES+=("apt")/true/; s/PACKAGES+=("command-not-found")/true/' scripts/build-bootstraps.sh
+          fi
+          python3 - <<'PY'
+          p = 'scripts/build-bootstraps.sh'
+          s = open(p).read()
+          old = '\tmv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "$TERMUX_PACKAGES_DIRECTORY/"\n'
+          new = ('\tmkdir -p /tmp/hasil-bootstrap && cp -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" /tmp/hasil-bootstrap/\n'
+                 '\tmv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "$TERMUX_BUILT_DEBS_DIRECTORY/" || echo "mv gagal, salinan ada di /tmp/hasil-bootstrap"\n')
+          assert old in s, "baris mv tidak ditemukan"
+          open(p, 'w').write(s.replace(old, new))
+          PY
+          grep -n 'hasil-bootstrap' scripts/build-bootstraps.sh
+          grep -n 'libbz2\|"apt"\|command-not-found' scripts/build-bootstraps.sh || true
+      - name: Siapkan sumber dash (git.kernel.org kadang mengirim berkas kosong)
+        working-directory: tp
+        run: |
+          URL="https://git.kernel.org/pub/scm/utils/dash/dash.git/snapshot/dash-0.5.13.5.tar.gz"
+          EXP="53622e51df0fd7a2950552cfe0da0bee9bfc1510784e752b62eacc49b3776d33"
+          ok=0
+          for i in 1 2 3 4; do
+            if curl -fsSL --max-time 120 -o /tmp/dash.tgz "$URL" && echo "$EXP  /tmp/dash.tgz" | sha256sum -c -; then ok=1; break; fi
+            echo "Unduhan dash gagal ($i/4), menunggu..."; sleep 20
+          done
+          if [ "$ok" = 0 ]; then
+            echo "git.kernel.org gagal. Memakai tarball resmi dari gondor.apana.org.au (checksum dilewati, dicatat di bawah)"
+            sed -i 's|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL="http://gondor.apana.org.au/~herbert/dash/files/dash-${TERMUX_PKG_VERSION}.tar.gz"|; s|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=SKIP_CHECKSUM|' packages/dash/build.sh
+            curl -fsSL --max-time 120 http://gondor.apana.org.au/~herbert/dash/files/dash-0.5.13.5.tar.gz | sha256sum || true
+          fi
+      - name: Bangun bootstrap aarch64
+        working-directory: tp
+        env:
+          TAMBAHAN: ${{ inputs.paket_tambahan }}
+        run: |
+          set -o pipefail
+          TAMBAHAN="$(echo "$TAMBAHAN" | sed -E 's/(^|,)curl(,|$)/\1libcurl\2/g; s/(^|,)curl(,|$)/\1libcurl\2/g')"
+          echo "Paket tambahan: $TAMBAHAN"
+          ARGS="--architectures aarch64"
+          if [ -n "$TAMBAHAN" ]; then ARGS="$ARGS --add $TAMBAHAN"; fi
+          for t in 1 2 3; do
+            echo "=== Percobaan $t dari 3 (paket yang sudah jadi tidak dibangun ulang) ===" | tee -a ../build.log
+            if ./scripts/run-docker.sh ./scripts/build-bootstraps.sh $ARGS 2>&1 | tee -a ../build.log; then exit 0; fi
+            sleep 30
+          done
+          exit 1
+      - name: Ambil zip bootstrap dari kontainer
+        if: always()
+        run: |
+          mkdir -p hasil
+          if ls tp/output/bootstrap-*.zip >/dev/null 2>&1; then cp tp/output/bootstrap-*.zip hasil/; fi
+          if ! ls hasil/bootstrap-*.zip >/dev/null 2>&1; then
+            docker cp termux-package-builder:/tmp/hasil-bootstrap/. hasil/ || true
+          fi
+          sudo chown -R "$(id -u):$(id -g)" hasil || true
+          sudo chown -R "$(id -u):$(id -g)" tp/output || true
+          ls -la hasil
+      - name: Simpan bootstrap
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap
+          path: hasil/bootstrap-*.zip
+          if-no-files-found: error
+      - name: Simpan paket deb (dasar repositori paket GSM)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: tp/output/*.deb
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Simpan log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log
+          path: build.log
+          if-no-files-found: ignore
