@@ -1,0 +1,235 @@
+name: Repo GSM
+on:
+  workflow_dispatch:
+    inputs:
+      nama_paket:
+        description: "Nama paket aplikasi (menentukan folder /data/data/NAMA/files/usr)"
+        required: true
+        default: "com.garuda.simplemanager"
+      paket:
+        description: "Paket yang dibangun, pisahkan dengan koma"
+        required: true
+        default: "ripgrep"
+      tag:
+        description: "Nama rilis GitHub yang menjadi repo apt"
+        required: true
+        default: "apt"
+      dari_run:
+        description: "Nomor run sebelumnya: lewati pembangunan, terbitkan saja deb dari run itu (kosong = bangun baru)"
+        required: false
+        default: ""
+permissions:
+  contents: write
+  actions: read
+jobs:
+  bangun:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Ambil sumber paket Termux
+        if: inputs.dari_run == ''
+        uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          path: tp
+          fetch-depth: 1
+      - name: Bebaskan ruang disk
+        if: inputs.dari_run == ''
+        working-directory: tp
+        run: ./scripts/free-space.sh
+      - name: Bebaskan ruang disk tambahan (bawaan runner yang tidak dipakai)
+        if: inputs.dari_run == ''
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo docker system prune -af --volumes 2>/dev/null || true
+          df -h / || true
+      - name: Paksa Docker pakai storage-driver vfs (hindari bug overlayfs gagal extract layer)
+        if: inputs.dari_run == ''
+        run: |
+          sudo systemctl stop docker || true
+          sudo mkdir -p /etc/docker
+          echo '{"storage-driver":"vfs"}' | sudo tee /etc/docker/daemon.json
+          sudo rm -rf /var/lib/docker
+          sudo systemctl start docker
+          sleep 3
+          docker info 2>/dev/null | grep -i "storage driver" || true
+      - name: Ganti nama paket aplikasi
+        if: inputs.dari_run == ''
+        working-directory: tp
+        env:
+          NAMA: ${{ inputs.nama_paket }}
+        run: |
+          sed -i "s|^TERMUX_APP__PACKAGE_NAME=.*|TERMUX_APP__PACKAGE_NAME=\"${NAMA}\"|" scripts/properties.sh
+          grep -n '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
+      - name: Bangun image builder sendiri (image ghcr.io resmi rusak di satu lapisan, lewati dengan bangun dari resep)
+        if: inputs.dari_run == ''
+        working-directory: tp/scripts
+        run: |
+          docker build -t gsm-local-builder -f Dockerfile . 2>&1 | tail -100
+          echo "GSM_LOCAL_IMAGE=gsm-local-builder" >> "$GITHUB_ENV"
+      - name: Tambal paket yang rewel di NDK Android
+        if: inputs.dari_run == ''
+        working-directory: tp
+        run: |
+          # gforth: kode lama signals.c memakai bsd_signal dengan tipe penunjuk fungsi
+          # yang ditolak clang modern (error, dulunya cuma peringatan). Kita longgarkan
+          # khusus untuk paket ini saja, bukan untuk paket lain.
+          sudo apt-get install -y -qq gforth >/dev/null 2>&1 || true
+
+          f=packages/gforth/build.sh
+          if [ -f "$f" ] && ! grep -q "Wno-error=incompatible-pointer-types" "$f"; then
+            printf '\nTERMUX_PKG_EXTRA_CFLAGS+=" -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"\n' >> "$f"
+            echo "Ditambal: $f"
+          fi
+
+          if [ -f "$f" ] && grep -q 'CC="gcc -m$TERMUX_ARCH_BITS"' "$f" && ! grep -q 'CFLAGS="-Wno-error=incompatible-pointer-types' "$f"; then
+            sed -i 's|CC="gcc -m\$TERMUX_ARCH_BITS"|CC="gcc -m$TERMUX_ARCH_BITS" CFLAGS="-Wno-error=incompatible-pointer-types -Wno-error=int-conversion"|' "$f"
+            echo "Ditambal (host-build): $f"
+          fi
+
+          # espeak: fitur audio-langsung (pcaudiolib) menyeret pulseaudio->dbus,
+          # yang memakai libtool/libltdl berat saat configure dan sering mati
+          # mendadak (kehabisan memori) di runner GitHub. Fitur ini opsional,
+          # espeak tetap bisa menghasilkan suara lewat file/stdout tanpa itu.
+          fe=packages/espeak/build.sh
+          if [ -f "$fe" ] && grep -q "pcaudiolib" "$fe"; then
+            sed -i 's/, pcaudiolib//; s/--with-pcaudiolib//' "$fe"
+            echo "Ditambal: $fe"
+          fi
+
+      - name: Bangun paket
+        if: inputs.dari_run == ''
+        working-directory: tp
+        timeout-minutes: 320
+        env:
+          DAFTAR: ${{ inputs.paket }}
+          TERMUX_BUILDER_IMAGE_NAME: gsm-local-builder
+        run: |
+          set -o pipefail
+          mkdir -p ../hasil
+          : > ../build.log
+          GAGAL=""
+          for n in $(echo "$DAFTAR" | tr ',' ' '); do
+            if [ -f "packages/$n/build.sh" ]; then
+              p="$n"
+            else
+              f="$(ls packages/*/"$n".subpackage.sh 2>/dev/null | head -1 || true)"
+              if [ -n "$f" ]; then p="$(basename "$(dirname "$f")")"; echo "Sub-paket $n dibangun lewat paket $p" | tee -a ../build.log; else echo "Paket $n gagal: tidak ada di sumber Termux" | tee -a ../build.log; GAGAL="$GAGAL $n"; continue; fi
+            fi
+            ok=0
+            # Siapkan kontainer lebih dulu. Pembuatan kontainer (tarik image dari ghcr.io)
+            # kadang gagal sesaat ("failed to extract layer to overlayfs") walau internet
+            # dan disk baik-baik saja - ini gangguan sesaat di sisi registry. Coba beberapa
+            # kali dengan jeda dan bersihkan cache Docker di antaranya sebelum menyerah.
+            for cu in 1 2 3 4 5; do
+              if ./scripts/run-docker.sh true >../siapkan.log 2>&1; then
+                echo "Kontainer siap (percobaan $cu)."
+                break
+              fi
+              echo "Gagal menyiapkan kontainer (percobaan $cu dari 5), lihat penyebab:"
+              tail -15 ../siapkan.log
+              docker rm -f termux-package-builder >/dev/null 2>&1 || true
+              docker system prune -af --volumes >/dev/null 2>&1 || true
+              sleep $((cu*20))
+            done
+            # pasang aturan unduh yang sabar (server sumber kadang lambat)
+            for c in $(docker ps -a --format '{{.Names}}' 2>/dev/null); do
+              docker exec "$c" sh -c 'printf "retry = 10\nretry-delay = 15\nretry-all-errors\nretry-connrefused\n" > "$HOME/.curlrc"' >/dev/null 2>&1 || true
+            done
+            for t in 1 2 3 4 5 6; do
+              echo "=== $p, percobaan $t dari 6 ===" | tee -a ../build.log
+              : > ../percobaan.log
+              if ./scripts/run-docker.sh ./build-package.sh -i -a aarch64 "$p" 2>&1 | tee -a ../build.log | tee ../percobaan.log; then ok=1; break; fi
+              # Ulangi hanya bila penyebabnya jaringan. Galat lain (dependensi hilang, kode gagal) berhenti sekarang.
+              if tail -n 400 ../percobaan.log | grep -qiE 'timed out|Could not resolve|Connection (reset|refused|closed)|Failed to download|curl: \([0-9]+\)|Temporary failure|unexpected EOF|TLS|HTTP/[0-9.]+ 5[0-9][0-9]|error: RPC failed|early EOF|failed to extract layer|failed to pull image|error pulling image|toomanyrequests|blob upload unknown|context deadline exceeded'; then
+                echo "Gangguan jaringan/Docker terdeteksi. Bersihkan cache Docker lalu tunggu $((t*60)) detik." | tee -a ../build.log
+                docker system prune -af --volumes >/dev/null 2>&1 || true
+                df -h / | tee -a ../build.log || true
+                sleep $((t*60))
+              else
+                echo "Bukan gangguan jaringan, jadi tidak diulang." | tee -a ../build.log
+                echo "PENYEBAB $p:" | tee -a ../build.log
+                tail -60 ../percobaan.log | cut -c 1-220 | tee -a ../build.log
+                break
+              fi
+            done
+            if [ "$ok" = 0 ]; then echo "Paket $p gagal dibangun" | tee -a ../build.log; GAGAL="$GAGAL $p"; fi
+          done
+          echo "GAGAL:$GAGAL" | tee -a ../build.log
+          echo "GAGAL=$GAGAL" >> "$GITHUB_ENV"
+      - name: Kumpulkan paket deb
+        if: always() && inputs.dari_run == ''
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" tp/output 2>/dev/null || true
+          mkdir -p hasil
+          echo "--- isi tp/output ---"
+          ls -la tp/output 2>/dev/null | head -30 || true
+          cp -f tp/output/*.deb hasil/ 2>/dev/null || true
+          if ! ls hasil/*.deb >/dev/null 2>&1; then
+            echo "tp/output tidak berisi deb. Mencoba menyalin dari kontainer docker."
+            docker ps -a --format '{{.Names}}' || true
+            for c in $(docker ps -a --format '{{.Names}}' 2>/dev/null); do
+              docker cp "$c:/home/builder/termux-packages/output/." hasil/ 2>/dev/null || true
+            done
+            find hasil -type f ! -name '*.deb' -delete 2>/dev/null || true
+          fi
+          if ! ls hasil/*.deb >/dev/null 2>&1; then
+            echo "Masih kosong. Mencari deb di seluruh disk."
+            find / -xdev -name '*_aarch64.deb' -size +1k 2>/dev/null | head -80 | while read -r f; do echo "ketemu: $f"; cp -f "$f" hasil/; done
+          fi
+          cd hasil
+          for f in *.deb; do
+            [ -e "$f" ] || continue
+            n="$(printf '%s' "$f" | sed 's/+/plus/g; s/[^A-Za-z0-9._-]/-/g')"
+            [ "$f" = "$n" ] || mv -f "$f" "$n"
+          done
+          echo "--- hasil ---"
+          ls -la | head -80
+      - name: Ambil paket dari run sebelumnya
+        if: inputs.dari_run != ''
+        run: |
+          mkdir -p hasil
+          gh run download "${{ inputs.dari_run }}" -n deb -D hasil
+          ls -la hasil | head -80
+      - name: Terbitkan repo apt
+        if: always()
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          if ! ls hasil/*.deb >/dev/null 2>&1; then echo "Tidak ada .deb baru, repo tidak diubah"; exit 0; fi
+          sudo apt-get install -y -qq apt-utils >/dev/null 2>&1 || true
+          mkdir -p pub
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Repo apt GSM" --notes "Repo paket apt GSM (aarch64). Pakai: deb [trusted=yes] URL ./"
+          gh release download "$TAG" --dir pub --pattern '*.deb' || true
+          cp -f hasil/*.deb pub/
+          cd pub
+          apt-ftparchive packages . > Packages
+          gzip -k -f Packages
+          apt-ftparchive release . > Release
+          gh release upload "$TAG" ./*.deb Packages Packages.gz Release --clobber
+          echo "Jumlah paket di indeks: $(grep -c '^Package:' Packages)"
+      - name: Simpan log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: log
+          path: build.log
+          if-no-files-found: ignore
+      - name: Simpan paket deb (cadangan 14 hari)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: hasil/*.deb
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Gagalkan bila ada paket yang gagal
+        if: always()
+        run: |
+          if [ -n "${GAGAL:-}" ]; then echo "Paket gagal:$GAGAL"; exit 1; fi
